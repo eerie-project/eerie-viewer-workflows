@@ -2,6 +2,7 @@ import importlib
 import json
 import os
 from pathlib import Path
+from time import perf_counter
 
 import pandas
 import xarray
@@ -96,6 +97,46 @@ def get_zarr_url(bucket: str, base_path: str, default_prefix: str | None = None)
     return f"s3://{bucket}/{'/'.join(parts)}"
 
 
+def log_upload_config(
+    upload_name: str, zarr_url: str, ifiles: list[str], chunks: dict[str, int]
+) -> None:
+    """Log the key configuration for one upload operation."""
+    logger.info(
+        f"[{upload_name}] target={zarr_url} inputs={len(ifiles)} chunks={chunks}"
+    )
+    logger.info(f"[{upload_name}] input_files={ifiles}")
+
+
+def log_dataset_state(upload_name: str, dataset: xarray.Dataset, stage: str) -> None:
+    """Log dataset shape and variable count at a processing stage."""
+    dims_str = ", ".join(f"{dim}={size}" for dim, size in dataset.sizes.items())
+    logger.info(
+        f"[{upload_name}] {stage}: vars={len(dataset.data_vars)} dims=({dims_str})"
+    )
+
+
+def write_dataset_to_zarr(
+    dataset: xarray.Dataset,
+    zarr_url: str,
+    encoding: dict[str, dict],
+    fs,
+    upload_name: str,
+) -> None:
+    """Write a prepared dataset to Zarr while logging lifecycle and duration."""
+    store = zarr.storage.FSStore(zarr_url, fs=fs)
+    if fs.exists(zarr_url):
+        logger.info(f"[{upload_name}] clearing existing store at {zarr_url}")
+        fs.rm(zarr_url, recursive=True)
+    start = perf_counter()
+    logger.info(f"[{upload_name}] writing dataset to {zarr_url}")
+    with ProgressBar():
+        dataset.to_zarr(
+            store=store, zarr_format=2, consolidated=True, encoding=encoding, mode="w"
+        )
+    elapsed = perf_counter() - start
+    logger.info(f"[{upload_name}] upload complete in {elapsed:.1f}s")
+
+
 def upload_eerie_climatologies(
     variables: list[str], product: str = "clim", experiment: str = "control", grid="025"
 ):
@@ -110,7 +151,6 @@ def upload_eerie_climatologies(
     ifiles = [
         f"{idir}/{varname}_{experiment}_EERIE_{product}.nc" for varname in variables
     ]
-    logger.info(f"Reading  {ifiles}")
     if grid == "025":
         latchunk, lonchunk = 721, 1440
     elif grid == "125":
@@ -118,21 +158,16 @@ def upload_eerie_climatologies(
     else:
         raise RuntimeError(f"Unsupported {grid=}")
     chunks = dict(member=1, period=-1, time_filter=1, lat=latchunk, lon=lonchunk)
+    upload_name = f"eerie-climatologies:{experiment}:{product}:{grid}"
+    log_upload_config(upload_name, zarr_url, ifiles, chunks)
     dataset = get_merged_dataset(ifiles, chunks)
+    log_dataset_state(upload_name, dataset, "merged")
     dataset = set_cmor_metadata(dataset, product)
     dataset = shorten_members(dataset)
+    log_dataset_state(upload_name, dataset, "metadata-applied")
     encoding = get_encoding(dataset, chunks)
     fs = get_filesystem()
-    # Create an S3 store
-    store = zarr.storage.FSStore(zarr_url, fs=fs)
-    if fs.exists(zarr_url):
-        logger.info(f"Clearing existing store {zarr_url}")
-        fs.rm(zarr_url, recursive=True)
-    with ProgressBar():
-        logger.info(f"Saving {dataset} to {zarr_url}")
-        dataset.to_zarr(
-            store=store, zarr_format=2, consolidated=True, encoding=encoding, mode="w"
-        )
+    write_dataset_to_zarr(dataset, zarr_url, encoding, fs, upload_name)
 
 
 def get_obs_file(idir: Path, varname: str, product: str, region_set: str | None = None):
@@ -156,20 +191,16 @@ def upload_obs_climatologies(variables: list[str], product="clim"):
     zarr_url = get_zarr_url(bucket, f"decadal/obs_{product}.zarr")
     ifiles = [get_obs_file(idir, varname, product) for varname in variables]
     chunks = dict(period=1, time_filter=1, lat=721, lon=1440)
+    upload_name = f"obs-climatologies:{product}"
+    log_upload_config(upload_name, zarr_url, ifiles, chunks)
     dataset = get_merged_dataset(ifiles, chunks)
+    log_dataset_state(upload_name, dataset, "merged")
     dataset = dataset.drop_vars(["height2m", "height10m", "height_2"], errors="ignore")
     dataset = set_cmor_metadata(dataset, product)
+    log_dataset_state(upload_name, dataset, "metadata-applied")
     encoding = get_encoding(dataset, chunks)
     fs = get_filesystem()
-    # Create an S3 store
-    store = zarr.storage.FSStore(zarr_url, fs=fs)
-    if fs.exists(zarr_url):
-        logger.info(f"Clearing existing store {zarr_url}")
-        fs.rm(zarr_url, recursive=True)
-    with ProgressBar():
-        dataset.to_zarr(
-            store=store, zarr_format=2, consolidated=True, encoding=encoding, mode="w"
-        )
+    write_dataset_to_zarr(dataset, zarr_url, encoding, fs, upload_name)
 
 
 def upload_eerie_time_series(variables: list[str], experiment: str, region_set: str):
@@ -185,22 +216,18 @@ def upload_eerie_time_series(variables: list[str], experiment: str, region_set: 
         for varname in variables
     ]
     chunks = dict(time_filter=1, time=-1, region=1)
+    upload_name = f"eerie-time-series:{experiment}:{region_set}"
+    log_upload_config(upload_name, zarr_url, ifiles, chunks)
     dataset = get_merged_dataset(ifiles, chunks)
+    log_dataset_state(upload_name, dataset, "merged")
     dataset = dataset.drop_vars(["height2m", "height10m", "height_3"], errors="ignore")
     dataset = set_cmor_metadata(dataset, "ts")
     if experiment != "hist-amip":
         dataset = shorten_members(dataset)
+    log_dataset_state(upload_name, dataset, "metadata-applied")
     encoding = get_encoding(dataset, chunks)
     fs = get_filesystem()
-    # Create an S3 store
-    store = zarr.storage.FSStore(zarr_url, fs=fs)
-    if fs.exists(zarr_url):
-        logger.info(f"Clearing existing store {zarr_url}")
-        fs.rm(zarr_url, recursive=True)
-    with ProgressBar():
-        dataset.to_zarr(
-            store=store, zarr_format=2, consolidated=True, encoding=encoding, mode="w"
-        )
+    write_dataset_to_zarr(dataset, zarr_url, encoding, fs, upload_name)
 
 
 def upload_obs_time_series(variables: list[str], region_set: str):
@@ -213,23 +240,18 @@ def upload_obs_time_series(variables: list[str], region_set: str):
         get_obs_file(idir, varname, "ts", region_set=region_set)
         for varname in variables
     ]
-    logger.info(f"Reading {ifiles}")
     chunks = dict(time_filter=1, time=-1, region=1)
+    upload_name = f"obs-time-series:{region_set}"
+    log_upload_config(upload_name, zarr_url, ifiles, chunks)
     dataset = get_merged_dataset(ifiles, chunks, drop_member=True)
+    log_dataset_state(upload_name, dataset, "merged")
     dataset = dataset.drop_vars(["height2m", "height10m"], errors="ignore")
     dataset = set_cmor_metadata(dataset, "ts")
     dataset = dataset.chunk(chunks)
+    log_dataset_state(upload_name, dataset, "metadata-applied")
     encoding = get_encoding(dataset, chunks)
     fs = get_filesystem()
-    # Create an S3 store
-    store = zarr.storage.FSStore(zarr_url, fs=fs)
-    if fs.exists(zarr_url):
-        logger.info(f"Clearing existing store {zarr_url}")
-        fs.rm(zarr_url, recursive=True)
-    with ProgressBar():
-        dataset.to_zarr(
-            store=store, zarr_format=2, consolidated=True, encoding=encoding, mode="w"
-        )
+    write_dataset_to_zarr(dataset, zarr_url, encoding, fs, upload_name)
 
 
 def upload_eddy_rich_zarr():
@@ -244,23 +266,17 @@ def upload_eddy_rich_zarr():
     zarr_url = get_zarr_url(
         bucket, "misc/icon-esm-er.hist-1950_u_v_ocean_19700101.zarr"
     )
-    logger.info(f"Writing {zarr_url}")
+    upload_name = "eddy-rich:single-level"
+    log_upload_config(upload_name, zarr_url, [str(ifile)], dict(lat=-1, lon=-1))
     dataset = xarray.open_dataset(ifile).squeeze().rename(u="uo", v="vo")
     dataset = fix_360_longitudes(dataset)
     dataset = dataset.drop_vars(["depth", "time"], errors="ignore")
     dataset = set_cmor_metadata(dataset, "clim")
     chunks = dict(lat=-1, lon=-1)
+    log_dataset_state(upload_name, dataset, "metadata-applied")
     encoding = get_encoding(dataset, chunks)
     fs = get_filesystem()
-    # Create an S3 store
-    store = zarr.storage.FSStore(zarr_url, fs=fs)
-    if fs.exists(zarr_url):
-        logger.info(f"Clearing existing store {zarr_url}")
-        fs.rm(zarr_url, recursive=True)
-    with ProgressBar():
-        dataset.to_zarr(
-            store=store, zarr_format=2, consolidated=True, encoding=encoding, mode="w"
-        )
+    write_dataset_to_zarr(dataset, zarr_url, encoding, fs, upload_name)
 
 
 def upload_eddy_rich_zarr_5lev():
@@ -275,22 +291,18 @@ def upload_eddy_rich_zarr_5lev():
     zarr_url = get_zarr_url(
         bucket, "misc/icon-esm-er.hist-1950_u_v_ocean_19700101_5lev.zarr"
     )
-    logger.info(f"Writing {zarr_url}")
+    upload_name = "eddy-rich:five-level"
+    log_upload_config(
+        upload_name, zarr_url, [str(ifile)], dict(depth=1, lat=-1, lon=-1)
+    )
     dataset = xarray.open_dataset(ifile).squeeze().rename(u="uo", v="vo")
     dataset = dataset.drop_vars(["time"], errors="ignore")
     dataset = set_cmor_metadata(dataset, "clim")
     chunks = dict(depth=1, lat=-1, lon=-1)
+    log_dataset_state(upload_name, dataset, "metadata-applied")
     encoding = get_encoding(dataset, chunks)
     fs = get_filesystem()
-    # Create an S3 store
-    store = zarr.storage.FSStore(zarr_url, fs=fs)
-    if fs.exists(zarr_url):
-        logger.info(f"Clearing existing store {zarr_url}")
-        fs.rm(zarr_url, recursive=True)
-    with ProgressBar():
-        dataset.to_zarr(
-            store=store, zarr_format=2, consolidated=True, encoding=encoding, mode="w"
-        )
+    write_dataset_to_zarr(dataset, zarr_url, encoding, fs, upload_name)
 
 
 def get_variable_cmor_metadata(varname: str):
