@@ -4,52 +4,111 @@ This needs significant resources (especially memory), try with 64G or 128G
 """
 
 import os
+from dataclasses import replace
 from pathlib import Path
 
-from dask.distributed import Client, LocalCluster
+import dask
+from dotenv import load_dotenv
 
 from eerieview.cmor import get_raw_variable_name, to_cmor_names
-from eerieview.constants import members_eerie_control
+from eerieview.constants import (
+    members_eerie_control_cmor,
+    members_eerie_future_cmor,
+    members_eerie_hist_cmor,
+)
 from eerieview.data_access import get_entry_dataset, get_main_catalogue
-from eerieview.data_models import EERIEMember
-from eerieview.data_processing import rename_realm
-from eerieview.ekf import DEFAULT_ENCODING, compute_monthly_eke
-from eerieview.io_utils import safe_to_netcdf
+from eerieview.data_models import CmorEerieMember, InputLocation, Member
+from eerieview.data_processing import retry_get_entry_with_fixes
+from eerieview.eke import DEFAULT_ENCODING, compute_monthly_eke
+from eerieview.io_utils import safe_to_zarr
+from eerieview.logger import get_logger
+
+load_dotenv()
+logger = get_logger(__name__)
+
+
+def compute_eke_for_member(
+    member: Member,
+    location: InputLocation,
+    clobber: bool = False,
+    num_workers: int | None = None,
+):
+    varname = "zos"
+    output_dir = os.environ["DIAGSDIR"]
+    # Input data must be daily and ocean
+    member = member.to_ocean().to_daily()
+    member_str = member.to_string()
+    if isinstance(member, CmorEerieMember) and (
+        "ifs-nemo" in member.model
+        or "ifs-fesom2-sr" in member.model
+        or "icon" in member.model
+    ):
+        member = replace(member, cmor_table="HROday")
+    # Get intermediate and final file names
+    final_member = member.to_atmos().slug
+    output_path = Path(output_dir, f"eke_{final_member}_monthly.zarr")
+    zos_daily_climatology_file = Path(
+        output_dir, f"zos_clim_{final_member}_dayofyear.zarr"
+    )
+    daily_anom_zos_file = Path(output_dir, f"zos_anom_{final_member}_daily.zarr")
+    if (
+        output_path.exists() or output_path.with_suffix(".nc").exists()
+    ) and not clobber:
+        logger.info(f"{output_path} already exists")
+    else:
+        # Open the catalogue entry
+        catalogue = get_main_catalogue()
+        if isinstance(member, CmorEerieMember):
+            rawname = varname
+        else:
+            rawname = get_raw_variable_name(member_str, varname)
+        try:
+            # Attempt to retrieve the dataset for the current member and variable
+            dataset = get_entry_dataset(catalogue, member, rawname, location=location)
+        except (KeyError, TypeError):
+            # If a KeyError occurs, retry with common fixes
+            dataset, member, rawname = retry_get_entry_with_fixes(
+                catalogue, get_entry_dataset, location, member, rawname, varname
+            )
+        # Rechunk before compute_monthly_eke.
+        # Pre-chunking to lat=50, lon=50 (matching the block
+        # size) reduces the number of dask tasks per block, even though the
+        # underlying stored chunks may be smaller.
+        dataset = dataset.chunk(dict(time=32, lat=50, lon=50))
+        # Rename to CMOR names
+        dataset_cmor = to_cmor_names(dataset, rawname, varname)
+        # Run computation
+        eke_monthly = compute_monthly_eke(
+            dataset_cmor,
+            daily_anom_zos_file,
+            zos_daily_climatology_file,
+            num_workers=num_workers,
+        )
+        safe_to_zarr(
+            eke_monthly,
+            output_path,
+            encoding=dict(eke=DEFAULT_ENCODING),
+            show_progress=True,
+        )
 
 
 def main():
-    cluster = LocalCluster()
-    print(cluster)
-    client = Client(cluster)
-    print("Dashboard URL:", client.dashboard_link)
-    location = "levante"
-    varname = "zos"
-    output_dir = os.environ["DIAGSDIR"]
-    member = members_eerie_control[1].replace("monthly", "daily")
-    member = rename_realm(member, varname)
-    catalogue = get_main_catalogue()
-    rawname = get_raw_variable_name(member, varname)
-    dataset = get_entry_dataset(catalogue, member, rawname, location=location).chunk(
-        dict(time=1000, lat=100, lon=100)
+    dask.config.set(scheduler="synchronous")
+    num_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", 0)) or None
+    location: InputLocation = "levante_cmor"
+    all_members = (
+        members_eerie_future_cmor + members_eerie_hist_cmor + members_eerie_control_cmor
     )
-    dataset_cmor = to_cmor_names(dataset, rawname, varname)
-    # Get intermediate and final file names
-    final_member = EERIEMember.from_string(member.replace("ocean", "atmos")).slug
-    output_path = Path(output_dir, f"eke_{final_member}_monthly.nc")
-    zos_daily_climatology_file = Path(
-        output_dir, f"zos_clim_{final_member}_dayofyear.nc"
-    )
-    daily_anom_zos_file = Path(output_dir, f"zos_anom_{final_member}_daily.nc")
-    # Run computation
-    eke_monthly = compute_monthly_eke(
-        dataset_cmor, daily_anom_zos_file, zos_daily_climatology_file
-    )
-    safe_to_netcdf(
-        eke_monthly,
-        output_path,
-        encoding=dict(eke=DEFAULT_ENCODING),
-        show_progress=True,
-    )
+    for member_str in all_members:
+        logger.info(f"Computing monthly EKE for {member_str}")
+        try:
+            member = CmorEerieMember.from_string(member_str)
+            compute_eke_for_member(
+                member, location, clobber=False, num_workers=num_workers
+            )
+        except Exception as e:
+            raise
+            #            logger.warning(f"EKE computation failed for {member_str} with error {e}")
 
 
 if __name__ == "__main__":

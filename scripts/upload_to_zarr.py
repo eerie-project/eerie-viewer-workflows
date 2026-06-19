@@ -17,49 +17,69 @@ from eerieview.zarr import get_filesystem
 load_dotenv()
 logger = get_logger(__name__)
 
-member2shortmeber = {
+member2shortmember = {
     "icon-esm-er-eerie-control-1950": "icon",
     "ifs-fesom2-sr-eerie-control-1950": "ifs-fesom2",
     "ifs-fesom2-sr-hist-1950": "ifs-fesom2",
     "icon-esm-er-hist-1950": "icon",
+    "ifs-nemo-er-hist-1950": "ifs-nemo-er",
+    "HadGEM3-GC5-EERIE-N216-ORCA025-eerie-historical": "hadgem3-mediumres",
+    "HadGEM3-GC5-EERIE-N640-ORCA12-eerie-historical": "hadgem3-hires",
+    "HadGEM3-GC5-EERIE-N96-ORCA1-eerie-historical": "hadgem3-lowres",
     "ifs-amip-tco1279-hist": "ifs-amip-tco1279-hist",
     "ifs-amip-tco1279-hist-c-0-a-lr20": "ifs-amip-tco1279-hist-c-0-a-lr20",
     "ifs-amip-tco399-hist-c-0-a-lr20": "ifs-amip-tco399-hist-c-0-a-lr20",
     "ifs-amip-tco399-hist-c-lr20-a-0": "ifs-amip-tco399-hist-c-lr20-a-0",
     "ifs-amip-tco399-hist": "ifs-amip-tco399-hist",
+    "icon-esm-er-highres-future-ssp245": "icon",
+    "ifs-fesom2-sr-highres-future-ssp245": "ifs-fesom2",
+    "ifs-nemo-er-highres-future-ssp245": "ifs-nemo-er",
+    "HadGEM3-GC5E-HH-historical": "hadgem3-hires",
+    "HadGEM3-GC5E-LL-historical": "hadgem3-lowres",
+    "HadGEM3-GC5E-LL-ssp245": "hadgem3-lowres",
+    "HadGEM3-GC5E-HH-ssp245": "hadgem3-hires",
 }
 
 
 def get_merged_dataset(ifiles, chunks, drop_member: bool = False):
     to_merge = [
         xarray.open_dataset(f)
-        .drop_vars(["height2m", "height10m", "height_2", "lev"], errors="ignore")
+        .drop_vars(
+            [
+                "height2m",
+                "height10m",
+                "height_2",
+                "height_3",
+                "lev",
+                "latitude_longitude",
+                "lon_bnds",
+                "lat_bnds",
+            ],
+            errors="ignore",
+        )
         .chunk(chunks)
         for f in ifiles
     ]
     if drop_member:
         to_merge = [ds.drop_vars("member") for ds in to_merge]
-    dataset = xarray.merge(to_merge)
+    dataset = xarray.merge(to_merge, join="outer")
     return dataset
 
 
-def get_encoding(variables, product, chunks):
+def get_encoding(ds: xarray.Dataset, chunks: dict[str, int]):
     encoding = {}
-    encoding_var = dict(dtype="float32", chunks=tuple(chunks.values()))
-    for v in variables:
-        encoding[v] = encoding_var
-        if product in ["clim", "series"]:
-            encoding[v + "_anom"] = encoding_var
-        elif product == "trend":
-            encoding[v + "_pvalue"] = encoding_var
-        else:
-            raise RuntimeError(f"Unknown product {product}")
-
+    for v in ds.data_vars:
+        # Match chunks to dimension order of the variable
+        var_chunks = tuple(chunks.get(str(d), -1) for d in ds[v].dims)
+        encoding[v] = dict(dtype="float32", chunks=var_chunks)
     return encoding
 
 
 def shorten_members(dataset):
-    dataset["member"] = dataset["member"].to_index().map(member2shortmeber)
+    logger.info(
+        f"Mapping members {dataset.member.to_index().tolist()} to short names with {member2shortmember}"
+    )
+    dataset["member"] = dataset["member"].to_index().map(member2shortmember)
     assert not dataset.member.isnull().any()
     return dataset
 
@@ -84,10 +104,13 @@ def upload_eerie_climatologies(
     dataset = get_merged_dataset(ifiles, chunks)
     dataset = set_cmor_metadata(dataset, product)
     dataset = shorten_members(dataset)
-    encoding = get_encoding(variables, product, chunks)
+    encoding = get_encoding(dataset, chunks)
     fs = get_filesystem()
     # Create an S3 store
     store = zarr.storage.FSStore(zarr_url, fs=fs)
+    if fs.exists(zarr_url):
+        logger.info(f"Clearing existing store {zarr_url}")
+        fs.rm(zarr_url, recursive=True)
     with ProgressBar():
         logger.info(f"Saving {dataset} to {zarr_url}")
         dataset.to_zarr(
@@ -117,10 +140,13 @@ def upload_obs_climatologies(variables: list[str], product="clim"):
     dataset = get_merged_dataset(ifiles, chunks)
     dataset = dataset.drop_vars(["height2m", "height10m", "height_2"], errors="ignore")
     dataset = set_cmor_metadata(dataset, product)
-    encoding = get_encoding(variables, product, chunks)
+    encoding = get_encoding(dataset, chunks)
     fs = get_filesystem()
     # Create an S3 store
     store = zarr.storage.FSStore(zarr_url, fs=fs)
+    if fs.exists(zarr_url):
+        logger.info(f"Clearing existing store {zarr_url}")
+        fs.rm(zarr_url, recursive=True)
     with ProgressBar():
         dataset.to_zarr(
             store=store, zarr_format=2, consolidated=True, encoding=encoding, mode="w"
@@ -136,16 +162,22 @@ def upload_eerie_time_series(variables: list[str], experiment: str, region_set: 
         f"{idir}/{varname}_{experiment}_EERIE_{region_set}_ts.nc"
         for varname in variables
     ]
-    chunks = dict(time_filter=1, time=-1, region=1)
+    chunks = dict(member=-1, time_filter=1, time=-1, region=1)
     dataset = get_merged_dataset(ifiles, chunks)
     dataset = dataset.drop_vars(["height2m", "height10m", "height_3"], errors="ignore")
     dataset = set_cmor_metadata(dataset, "ts")
+    dataset = dataset.chunk(chunks)
     if experiment != "hist-amip":
         dataset = shorten_members(dataset)
-    encoding = get_encoding(variables, "series", chunks)
+    encoding = get_encoding(dataset, chunks)
+    logger.info(dataset.tas)
+    logger.info(encoding)
     fs = get_filesystem()
     # Create an S3 store
     store = zarr.storage.FSStore(zarr_url, fs=fs)
+    if fs.exists(zarr_url):
+        logger.info(f"Clearing existing store {zarr_url}")
+        fs.rm(zarr_url, recursive=True)
     with ProgressBar():
         dataset.to_zarr(
             store=store, zarr_format=2, consolidated=True, encoding=encoding, mode="w"
@@ -164,12 +196,19 @@ def upload_obs_time_series(variables: list[str], region_set: str):
     logger.info(f"Reading {ifiles}")
     chunks = dict(time_filter=1, time=-1, region=1)
     dataset = get_merged_dataset(ifiles, chunks, drop_member=True)
+    # We need to add a member here, or the frontend breaks
+    dataset = dataset.expand_dims(dim=dict(member=["obs"]))
+    chunks = dict(member=1, time_filter=1, time=-1, region=1)
     dataset = dataset.drop_vars(["height2m", "height10m"], errors="ignore")
     dataset = set_cmor_metadata(dataset, "ts")
-    encoding = get_encoding(variables, "series", chunks)
+    dataset = dataset.chunk(chunks)
+    encoding = get_encoding(dataset, chunks)
     fs = get_filesystem()
     # Create an S3 store
     store = zarr.storage.FSStore(zarr_url, fs=fs)
+    if fs.exists(zarr_url):
+        logger.info(f"Clearing existing store {zarr_url}")
+        fs.rm(zarr_url, recursive=True)
     with ProgressBar():
         dataset.to_zarr(
             store=store, zarr_format=2, consolidated=True, encoding=encoding, mode="w"
@@ -179,7 +218,9 @@ def upload_obs_time_series(variables: list[str], region_set: str):
 def upload_eddy_rich_zarr():
     variables = ["uo", "vo"]
     ifile = Path(
-        os.environ["PRODUCTSDIR"], "misc", "icon-esm-er.hist-1950_u_v_ocean_19700101.nc"
+        os.environ["PRODUCTSDIR"],
+        "misc",
+        "icon-esm-er.hist-1950_u_v_ocean_197001_19700212_weekly.nc",
     )
     bucket = os.environ["S3_BUCKET"]
     zarr_url = f"s3://{bucket}/misc/icon-esm-er.hist-1950_u_v_ocean_19700101.zarr"
@@ -189,10 +230,13 @@ def upload_eddy_rich_zarr():
     dataset = dataset.drop_vars(["depth", "time"], errors="ignore")
     dataset = set_cmor_metadata(dataset, "clim")
     chunks = dict(lat=-1, lon=-1)
-    encoding = get_encoding(variables, "misc", chunks)
+    encoding = get_encoding(dataset, chunks)
     fs = get_filesystem()
     # Create an S3 store
     store = zarr.storage.FSStore(zarr_url, fs=fs)
+    if fs.exists(zarr_url):
+        logger.info(f"Clearing existing store {zarr_url}")
+        fs.rm(zarr_url, recursive=True)
     with ProgressBar():
         dataset.to_zarr(
             store=store, zarr_format=2, consolidated=True, encoding=encoding, mode="w"
@@ -213,10 +257,13 @@ def upload_eddy_rich_zarr_5lev():
     dataset = dataset.drop_vars(["time"], errors="ignore")
     dataset = set_cmor_metadata(dataset, "clim")
     chunks = dict(depth=1, lat=-1, lon=-1)
-    encoding = get_encoding(variables, "misc", chunks)
+    encoding = get_encoding(dataset, chunks)
     fs = get_filesystem()
     # Create an S3 store
     store = zarr.storage.FSStore(zarr_url, fs=fs)
+    if fs.exists(zarr_url):
+        logger.info(f"Clearing existing store {zarr_url}")
+        fs.rm(zarr_url, recursive=True)
     with ProgressBar():
         dataset.to_zarr(
             store=store, zarr_format=2, consolidated=True, encoding=encoding, mode="w"
@@ -249,8 +296,11 @@ def set_cmor_metadata(dataset: xarray.Dataset, product) -> xarray.Dataset:
         for attrname in ["long_name", "standard_name", "units"]:
             attrval = attrs[attrname]
             if attrname == "units":
-                if varname_noanom in ["tas", "tasmin", "tasmax"]:
-                    attrval = "degC"
+                if varname_noanom in ["tas", "tasmin", "tasmax", "tos"]:
+                    if product == "trend":
+                        attrval = "degC decade-1"
+                    else:
+                        attrval = "degC"
                 if varname_noanom == "pr":
                     attrval = "mm day-1"
             if "anom" in str(varname):
@@ -270,8 +320,9 @@ def upload_time_series(
 ):
     upload_obs_time_series(variables, region_set)
     upload_eerie_time_series(variables, "hist", region_set)
-    upload_eerie_time_series(variables_amip, "hist-amip", region_set)
+    # upload_eerie_time_series(variables_amip, "hist-amip", region_set)
     upload_eerie_time_series(variables, "control", region_set)
+    upload_eerie_time_series(variables, "future", region_set)
 
 
 def main():
@@ -288,10 +339,10 @@ def main():
         "zos",
         "eke",
     ]
-    variables_amip = [v for v in variables if v not in ["zos", "eke"]]
+    variables_amip = [v for v in variables if v not in ["zos", "eke", "so"]]
     for product in ["clim", "trend"]:
         upload_obs_climatologies(variables, product=product)
-        for experiment in ["hist", "control", "hist-amip"]:
+        for experiment in ["future", "hist", "control"]:  # , "hist-amip"]:
             if experiment == "hist-amip":
                 variables_exp = variables_amip
             else:
@@ -305,4 +356,4 @@ def main():
 
 
 if __name__ == "__main__":
-    upload_eddy_rich_zarr()
+    main()

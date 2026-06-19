@@ -10,9 +10,12 @@ from dotenv import load_dotenv
 from matplotlib import pyplot
 from matplotlib.dates import DateFormatter
 
+from eerieview.logger import get_logger
 from eerieview.zarr import get_filesystem
 
 load_dotenv()
+
+logger = get_logger(__name__)
 
 
 def main():
@@ -26,9 +29,14 @@ def main():
         product = row.product
         dataset_name = row.dataset
         print(f"Reading {zarr_path}")
-        dataset = xarray.open_zarr(fs.get_mapper(zarr_path), consolidated=True)
+        try:
+            dataset = xarray.open_zarr(fs.get_mapper(zarr_path), consolidated=True)
+        except Exception as e:
+            logger.error(f"Could not read {zarr_path}, failed with error: {e}")
+            continue
         if product == "ts":
             dataset["time"] = dataset.time.dt.year
+            print(dataset)
 
         for variable in eval(row.variables):
             plot_variable(dataset, dataset_name, product, row, variable)
@@ -38,13 +46,14 @@ def main():
 
 def plot_variable(dataset, dataset_name, product, row, variable):
     if product in ["clim", "trend"]:
-        agg_data = dataset[variable].mean(dim=("lat", "lon"))
+        return None
+        agg_data = dataset[variable].mean(dim=("lat", "lon")).squeeze()
         if dataset_name != "obs":
             table = agg_data.stack(period_filter=("period", "time_filter")).to_pandas()
         else:
             table = agg_data.to_pandas()
     elif product == "ts":
-        agg_data = dataset[variable].mean(dim="region")
+        agg_data = dataset[variable].mean(dim="region").squeeze(drop=True)
         if dataset_name != "obs":
             table = (
                 agg_data.stack(member_filter=("member", "time_filter")).to_pandas().T
@@ -54,7 +63,7 @@ def plot_variable(dataset, dataset_name, product, row, variable):
     else:
         raise RuntimeError("Unknown product")
     units = dataset[variable].attrs["units"]
-    pyplot.figure(figsize=(8, 4))
+    pyplot.figure(figsize=(15, 7.5))
     ax = sns.heatmap(table, cbar_kws=dict(label=units))
     pyplot.title(f"{variable=} {dataset_name=} {product=}")
     ax.fmt_xdata = DateFormatter("% Y")

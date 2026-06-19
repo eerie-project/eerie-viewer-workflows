@@ -1,4 +1,5 @@
 import importlib
+from dataclasses import replace
 from datetime import datetime
 from itertools import chain
 from pathlib import Path
@@ -9,7 +10,14 @@ import xarray
 import xarray_regrid  # noqa: F401 # Imported for its side effects (adds .regrid accessor)
 
 from eerieview.constants import OCEAN_VARIABLES
-from eerieview.data_models import EERIEProduct, InputLocation, PeriodsConfig, TimeFilter
+from eerieview.data_models import (
+    CmorEerieMember,
+    EERIEMember,
+    InputLocation,
+    Member,
+    PeriodsConfig,
+    TimeFilter,
+)
 from eerieview.exceptions import EmptySliceError
 from eerieview.logger import get_logger
 from eerieview.regions import SpatialAggregation
@@ -140,7 +148,7 @@ def seltime(
         if time_unit not in ("year", "season", "month", "day", "hour"):
             raise KeyError(f"Time unit '{time_unit}' not supported.")
         time_str = f"{time_coord}.{time_unit}"
-        time_mask_temp = numpy.in1d(ids[time_str], time_values)
+        time_mask_temp = numpy.isin(ids[time_str], time_values)
         time_mask = numpy.logical_and(time_mask, time_mask_temp)
     ods = ids.isel(**{time_coord: time_mask})  # type: ignore
     return ods
@@ -323,6 +331,7 @@ def aggregate_regions(
     set2filename = {
         "EDDY": "Eddy-rich-regions.geojson",
         "IPCC": "IPCC-WGI-reference-regions-v4_areas.geojson",
+        "Global": "global_region.geojson",
     }
     regions_file = Path(
         str(importlib.resources.files("eerieview")),
@@ -339,23 +348,99 @@ def retry_get_entry_with_fixes(
     catalogue: dict,
     get_entry_dataset_fun,
     location: InputLocation,
-    member: str,
+    member: Member,
     rawname: str,
     varname: str,
-) -> tuple[xarray.Dataset, str, str]:
+) -> tuple[xarray.Dataset, Member, str]:
     """Attempt to retrieve a dataset with common fixes if the initial attempt fails."""
-    member = member.replace("monthly", "daily")
+    if isinstance(member, EERIEMember) and member.simulation:
+        member_str = member.to_string()
+        member_str = member_str.replace("monthly", "daily")
+        # Specific fixes for tasmax/tasmin with fesom
+        if varname == "tasmax" and "fesom" in member_str:
+            member_str = member_str.replace("avg", "max")
+            if "24" not in rawname:
+                rawname += "24"  #  Append '24' to rawname for daily maximum
+        if varname == "tasmin" and "fesom" in member_str:
+            member_str = member_str.replace("avg", "min")
+            if "24" not in rawname:
+                rawname += "24"  # Append '24' to rawname for daily minimum
+        member = EERIEMember.from_string(member_str)
+        # Retry getting the dataset with the applied fixes
+        dataset = get_entry_dataset_fun(catalogue, member, rawname, location=location)
+    elif isinstance(member, CmorEerieMember):
+        # Read from files
+        if member.model == "ifs-nemo-er":
+            basedir = Path("/work/bm1344/DKRZ/CMOR/EERIE/HighResMIP/BSC/IFS-NEMO-ER")
+            grid = "gr"
+            pattern_to_expand = f"{rawname}_{member.cmor_table}_*.nc"
+        elif member.model == "ifs-fesom2-sr":
+            basedir = Path("/work/kd0956/EERIE_CMOR/EERIE/EERIE/AWI/IFS-FESOM2-SR")
+            grid = "gr"
+            pattern_to_expand = f"{rawname}_{member.cmor_table}_*.nc"
+        elif "hadgem3" in member.model.lower():
+            hadgem_atmos2ocean = {
+                "HadGEM3-GC5E-LL": "hadgem3-gc5-n96-orca1",
+                "HadGEM3-GC5E-HH": "hadgem3-gc5-n640-orca12",
+            }
 
-    # Specific fixes for tasmax/tasmin with fesom
-    if varname == "tasmax" and "fesom" in member:
-        member = member.replace("avg", "max")
-        rawname += "24"  # Append '24' to rawname for daily maximum
-    if varname == "tasmin" and "fesom" in member:
-        member = member.replace("avg", "min")
-        rawname += "24"  # Append '24' to rawname for daily minimum
+            hadgem_sim2ocean = {
+                "historical": "eerie-historical",
+                "ssp245": "eerie-ssp245",
+            }
 
-    # Retry getting the dataset with the applied fixes
-    dataset = get_entry_dataset_fun(catalogue, member, rawname, location=location)
+            if member.model in hadgem_atmos2ocean and varname in ["tos", "zos"]:
+                ocean_model = hadgem_atmos2ocean[member.model]
+                ocean_sim = hadgem_sim2ocean[member.simulation]
+                cmor_table = "Omon" if varname == "tos" else "Oday"
+                rawname = "toscon" if varname == "tos" else "zos"
+                catalog_entry = catalogue[
+                    f"dkrz.disk.model-output.{ocean_model}.{ocean_sim}.ocean.gr1.{cmor_table}"
+                ]()
+                dataset = catalog_entry.to_dask()[[rawname]]
+                dataset = dataset.sortby("time")
+                return dataset, member, rawname
+
+            basedir = Path(f"/work/bm1344/DKRZ/MOHC/{member.model}")
+            grid = "gr1"
+            if rawname == "tos":
+                rawname = "toscon"
+                member = replace(member, version="v20251126")
+            elif rawname == "zos":
+                pass  # version stays at v20250425 for Oday/zos
+            else:
+                pass
+            pattern_to_expand = f"{rawname}_*.nc"
+        else:
+            raise RuntimeError(f"Unknown model: {member.model}")
+        dirs = (
+            f"{member.simulation}/r1i1p1f1/{member.cmor_table}/{rawname}/{grid}/"
+            f"{member.version}/"
+        )
+        path_with_files = Path(basedir, dirs)
+        paths_to_read = sorted(path_with_files.glob(pattern_to_expand))
+        logger.info(f"{path_with_files}/{pattern_to_expand}")
+        dataset = xarray.open_mfdataset(
+            paths_to_read,
+            concat_dim="time",
+            combine="nested",
+            coords="minimal",
+            data_vars="minimal",
+            chunks=dict(time=1000, lat=100, lon=100),
+        )
+    else:
+        raise RuntimeError(f"Unknown member type {member}")
+    vars_to_drop = [
+        "forecast_period",
+        "forecast_period_bnds",
+        "forecast_period",
+        "time_bnds",
+        "lat_bnds",
+        "lon_bnds",
+        "height",
+        "time_bounds",
+    ]
+    dataset = dataset.drop_vars(vars_to_drop, errors="ignore")
     return dataset, member, rawname
 
 
@@ -422,40 +507,52 @@ def add_anomalies(
 
 
 def fix_units(
-    dataset: xarray.Dataset, varname: str, product: EERIEProduct
+    dataset: xarray.Dataset, varname: str, product: str | None = None
 ) -> xarray.Dataset:
     """Fix units of certain variables to a common standard (e.g., K to degC, m/s to mm/day)."""
     if varname == "pr":
-        factor = 86400  # seconds in a day
-        # If ICON precipitation is in meters per second, convert to mm/day
-        if "m s**-1" in dataset[varname].attrs["units"]:
-            factor *= 1000  # meters to millimeters
-        dataset[varname] = dataset[varname] * factor
+        units = dataset[varname].attrs.get("units", "")
+        if units != "mm":
+            factor = 86400  # seconds in a day
+            # If ICON precipitation is in meters per second, convert to mm/day
+            if "m s**-1" in dataset[varname].attrs.get("units", ""):
+                factor *= 1000  # meters to millimeters
+            dataset[varname] = dataset[varname] * factor
         dataset[varname].attrs["units"] = "mm day-1"  # Set the correct units
     # Convert temperature variables from Kelvin to Celsius, unless it's a trend product
     if (
-        varname in ["tasmax", "tasmin", "tas"]
-        and dataset[varname].attrs.get("units") != "degC"
+        varname in ["tasmax", "tasmin", "tas", "tos"]
+        and dataset[varname].isel(time=5).max().compute().item() > 200
+        and product != "trend"
     ):
-        if (
-            product != "trend"
-        ):  # Trends in K are the same as in degC, no conversion needed
-            dataset[varname] = dataset[varname] - 273.15
+        dataset[varname] = dataset[varname] - 273.15
         dataset[varname].attrs["units"] = "degC"
+    if varname == "clt" and (dataset[varname].attrs.get("units") == "%"):
+        dataset[varname] = dataset[varname] * 0.01
+        dataset[varname].attrs["units"] = "1"
     return dataset
 
 
-def rename_realm(member: str, varname: str) -> str:
+def rename_realm(member: Member, varname: str) -> Member:
     """Adjust the member string based on the variable's realm (e.g., atmos to ocean)."""
     # For ocean variables, change 'atmos' to 'ocean' in member string
-    if varname in OCEAN_VARIABLES and "amip" not in member:
-        member = member.replace("atmos", "ocean")
+    if (
+        isinstance(member, EERIEMember)
+        and varname in OCEAN_VARIABLES
+        and "amip" != member.simulation
+    ):
+        member = replace(member, realm="ocean")
         # Specific fix for 'ifs-fesom2-sr' ocean data
-        if "ifs-fesom2-sr" in member:
-            member = member.replace("monthly", "daily")
-            member += "_1950-2014"
+        if "ifs-fesom2-sr" == member.model and (
+            "hist" in member.simulation or "control" in member.simulation
+        ):
+            member = replace(member, freq="daily_1950-2014")
     # Adjust member string for ICON tasmax/tasmin variables
-    if "icon" in member and varname in ["tasmax", "tasmin"]:
+    if (
+        isinstance(member, EERIEMember)
+        and "icon" in member.model
+        and varname in ["tasmax", "tasmin"]
+    ):
         extreme = "max" if varname == "tasmax" else "min"
-        member = member.replace("monthly_mean", f"daily_{extreme}")
+        member = replace(member, freq=f"daily_{extreme}")
     return member

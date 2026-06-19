@@ -4,12 +4,14 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from eerieview.constants import (
-    members_eerie_control,
-    members_eerie_hist,
+    members_eerie_control_cmor,
+    members_eerie_future_cmor,
     members_eerie_hist_amip,
+    members_eerie_hist_cmor,
 )
 from eerieview.data_access import get_diagnostic, get_entry_dataset
 from eerieview.data_models import (
+    CmorEerieMember,
     DecadalProduct,
     InputLocation,
     PeriodsConfig,
@@ -23,6 +25,7 @@ logger = get_logger(__name__)
 load_dotenv()
 
 # Define a list of variables to be processed
+
 VARIABLES = [
     "sfcWind",
     "uas",
@@ -31,11 +34,13 @@ VARIABLES = [
     "pr",
     "tos",
     "zos",
+    # "sos",
     "clt",
     "tasmax",
     "tasmin",
     "eke",
 ]
+
 
 """
 Main Processing Functions
@@ -45,11 +50,10 @@ for different experimental setups (control, historical, AMIP).
 """
 
 
-def main_control():
-    location: InputLocation = "levante"
-    product: DecadalProduct = "trend"
-    reference_period = (1951, 1970)
-    periods = [(1971, 1990), (1991, 2010), (2011, 2030), (2031, 2050)]
+def main_control(product: DecadalProduct):
+    location: InputLocation = "levante_cmor"
+    reference_period = (1951, 1980)
+    periods = [(1951, 1980), (1971, 2000), (1991, 2020), (2021, 2050)]
     periods_config = PeriodsConfig(reference_period, periods)
     output_dir = Path(os.environ["PRODUCTSDIR"], "decadal")
 
@@ -63,22 +67,57 @@ def main_control():
         get_model_decadal_product(
             varname=varname,
             output_dir=output_dir,
-            members=members_eerie_control,
+            members=members_eerie_control_cmor,
             periods=periods_config,
             product=product,
             experiment="control",
-            clobber=False,
+            clobber=True,
             location=location,
             get_entry_dataset_fun=get_entry_dataset_fun,
+            member_class=CmorEerieMember,
         )
 
 
-def main_hist():
-    location: InputLocation = "cloud"
-    product: DecadalProduct = "clim"
-    reference_period = (1951, 1970)
-    periods = [(1971, 1990), (1991, 2010)]
-    members = members_eerie_hist
+def main_future(product: DecadalProduct, members: list | None = None):
+    location: InputLocation = "levante_cmor"
+    reference_period = (1951, 1980)
+    periods = [(1971, 2000), (1991, 2020), (2021, 2050)]
+    if product == "trend":
+        periods += [
+            (1951, 2050),
+        ]
+    if members is None:
+        members = members_eerie_future_cmor
+    periods_config = PeriodsConfig(reference_period, periods)
+    output_dir = Path(os.environ["PRODUCTSDIR"], "decadal")
+
+    for varname in VARIABLES:
+        logger.info(f"Processing {varname} data for 'future' experiments")
+
+        get_entry_dataset_fun = (
+            get_diagnostic if varname == "eke" else get_entry_dataset
+        )
+
+        get_model_decadal_product(
+            varname=varname,
+            location=location,
+            output_dir=output_dir,
+            members=members,
+            periods=periods_config,
+            product=product,
+            experiment="future",
+            clobber=True,
+            get_entry_dataset_fun=get_entry_dataset_fun,
+            member_class=CmorEerieMember,
+        )
+
+
+def main_hist(product: DecadalProduct, members: list | None = None):
+    location: InputLocation = "levante_cmor"
+    reference_period = (1951, 1980)
+    periods = [(1971, 2000), (1991, 2020)]
+    if members is None:
+        members = members_eerie_hist_cmor
     periods_config = PeriodsConfig(reference_period, periods)
     output_dir = Path(os.environ["PRODUCTSDIR"], "decadal")
 
@@ -97,19 +136,20 @@ def main_hist():
             periods=periods_config,
             product=product,
             experiment="hist",
-            clobber=False,
+            clobber=True,
             get_entry_dataset_fun=get_entry_dataset_fun,
+            member_class=CmorEerieMember,
         )
 
 
 def main_amip():
     location: InputLocation = "levante"
-    product: DecadalProduct = "trend"
-    reference_period = (1981, 2000)
-    periods = [(2000, 2021)]
+    product: DecadalProduct = "clim"
+    reference_period = (1981, 2010)
+    periods = [(1991, 2020)]
     periods_config = PeriodsConfig(reference_period, periods)
     output_dir = Path(os.environ["PRODUCTSDIR"], "decadal")
-    variables_amip = [v for v in VARIABLES if v not in ["eke", "zos"]]
+    variables_amip = [v for v in VARIABLES if v not in ["eke", "zos", "sos"]]
     for varname in variables_amip:
         logger.info(f"Processing {varname} data for 'hist-amip' experiment")
         get_model_decadal_product(
@@ -120,9 +160,25 @@ def main_amip():
             periods=periods_config,
             product=product,
             experiment="hist-amip",
-            clobber=False,
+            clobber=True,
         )
 
 
+def members_with_eke_data(members: list) -> list:
+    """Filter member list to only those with a pre-computed eke file (zarr or nc) in DIAGSDIR."""
+    diagdir = os.environ["DIAGSDIR"]
+    result = []
+    for m in members:
+        slug = CmorEerieMember.from_string(m).slug
+        zarr_exists = Path(diagdir, f"eke_{slug}_monthly.zarr").exists()
+        nc_exists = Path(diagdir, f"eke_{slug}_monthly.nc").exists()
+        if zarr_exists or nc_exists:
+            result.append(m)
+    return result
+
+
 if __name__ == "__main__":
-    main_hist()
+    main_hist("clim", members=members_with_eke_data(members_eerie_hist_cmor))
+    main_hist("trend", members=members_with_eke_data(members_eerie_hist_cmor))
+    main_future("clim", members=members_with_eke_data(members_eerie_future_cmor))
+    main_future("trend", members=members_with_eke_data(members_eerie_future_cmor))

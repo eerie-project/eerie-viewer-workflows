@@ -77,6 +77,7 @@ def get_obs_decadal_product(
     climatologies = []
     rawname = CMOR2C3SATLAS[varname]
     dataset = get_obs_dataset_fun(obsdir, rawname).rename({rawname: varname})
+    dataset = fix_units(dataset, varname, product)
 
     # Iterate through each defined time filter (e.g., annual, seasonal).
     for time_filter in time_filters:
@@ -105,7 +106,7 @@ def get_obs_decadal_product(
             )
 
             # Fix units of the variable if necessary (e.g., temperature from K to degC, precipitation units).
-            dataset_product = fix_units(dataset_product, varname, product)
+
             climatologies.append(dataset_product)
 
     # Merge all individual product datasets into a single xarray Dataset.
@@ -153,8 +154,8 @@ def main():
 
     # --- ERA5 Data Processing ---
     # Define periods for ERA5 data processing.
-    reference_period_era5 = (1951, 1970)
-    periods_era5 = [(1971, 1990), (1991, 2010)]
+    reference_period_era5 = (1951, 1980)
+    periods_era5 = [(1971, 2000), (1991, 2020)]
     periods_config_era5 = PeriodsConfig(reference_period_era5, periods_era5)
     product: DecadalProduct = "clim"
 
@@ -186,9 +187,9 @@ def main():
     # --- AVISO Data Processing ---
     # Define periods for AVISO data processing (typically shorter timeframes).
     variables_aviso = ["zos", "eke"]
-    reference_period_aviso = (1991, 2010)
+    reference_period_aviso = (1991, 2020)
     periods_aviso = [
-        (1991, 2010)
+        (1991, 2020)
     ]  # This implies processing the reference period itself as a product
     periods_config_aviso = PeriodsConfig(reference_period_aviso, periods_aviso)
 
@@ -201,6 +202,24 @@ def main():
             output_dir,
             periods_config_aviso,
             "aviso",
+            product,
+            clobber=True,
+        )
+
+    # --- ORAS5 Data Processing ---
+    reference_period_oras5 = (1958, 1980)
+    periods_oras5 = [(1971, 2000), (1991, 2020)]
+    periods_config_oras5 = PeriodsConfig(reference_period_oras5, periods_oras5)
+    product: DecadalProduct = "clim"
+
+    for varname in ["sos"]:
+        logger.info(f"Processing ORAS5 data for variable: {varname}")
+        get_obs_decadal_product(
+            varname,
+            obsdir,
+            output_dir,
+            periods_config_oras5,
+            "oras5",
             product,
             clobber=False,
         )

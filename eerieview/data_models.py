@@ -1,35 +1,98 @@
-from dataclasses import dataclass
+import copy
+from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Literal, Tuple
+from typing import ClassVar, Literal, Tuple
 
 from eerieview.constants import NUM2MONTH
 
-InputLocation = Literal["levante", "cloud"]
+InputLocation = Literal["levante", "cloud", "levante_cmor"]
 DecadalProduct = Literal["clim", "trend"]
 EERIEProduct = Literal["series"] | DecadalProduct
 Period = Tuple[int, int]
 
 
 @dataclass
-class EERIEMember:
-    # 'ifs-fesom2-sr.hist-1950.v20240304.atmos.gr025.2D_monthly_avg'
+class Member:
     model: str
     simulation: str
     version: str
-    realm: str
-    grid: str
-    freq: str
+    npieces: ClassVar[int] = 4
 
     @classmethod
-    def from_string(cls, member_str: str) -> "EERIEMember":
+    def from_string(cls, member_str: str) -> "Member":
         pieces = member_str.split(".")
-        if len(pieces) != 6:
-            raise RuntimeError("Member string must have 6 sections separated by points")
+        if len(pieces) != cls.npieces:
+            raise RuntimeError(
+                f"Member string must have {cls.npieces} sections separated by points"
+            )
         return cls(*pieces)
 
     @property
     def slug(self) -> str:
         return f"{self.model}-{self.simulation}"
+
+    def to_string(self) -> str:
+        return ".".join(str(getattr(self, f.name)) for f in fields(self))
+
+    def to_ocean(self) -> "Member":
+        raise NotImplementedError
+
+    def to_atmos(self) -> "Member":
+        raise NotImplementedError
+
+    def to_daily(self) -> "Member":
+        raise NotImplementedError
+
+
+@dataclass
+class EERIEMember(Member):
+    # 'ifs-fesom2-sr.hist-1950.v20240304.atmos.gr025.2D_monthly_avg'
+    realm: str
+    grid: str
+    freq: str
+    npieces: ClassVar[int] = 6
+
+    def to_ocean(self) -> "EERIEMember":
+        new = copy.copy(self)
+        new.realm = "ocean"
+        return new
+
+    def to_atmos(self) -> "EERIEMember":
+        new = copy.copy(self)
+        new.realm = "atmos"
+        return new
+
+    def to_daily(self) -> "EERIEMember":
+        new = copy.copy(self)
+        new.freq = "daily"
+        return new
+
+
+@dataclass
+class CmorEerieMember(Member):
+    # 'ifs-nemo-er.hist-1950.v20250516.gr025.Amon'
+    grid: str
+    cmor_table: str
+    npieces: ClassVar[int] = 5
+
+    def to_ocean(self) -> "CmorEerieMember":
+        new = copy.copy(self)
+        new.cmor_table = self.cmor_table.replace("A", "O")
+        return new
+
+    def to_atmos(self) -> "CmorEerieMember":
+        new = copy.copy(self)
+        new.cmor_table = self.cmor_table.replace("O", "A")
+        return new
+
+    def to_daily(self) -> "CmorEerieMember":
+        if self.cmor_table == "Omon":
+            new_table = "Oday"
+        else:
+            new_table = "day"
+        new = copy.copy(self)
+        new.cmor_table = new_table
+        return new
 
 
 @dataclass

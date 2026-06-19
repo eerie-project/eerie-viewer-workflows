@@ -3,6 +3,7 @@ from pathlib import Path
 
 import dask
 import xarray
+from dotenv import load_dotenv
 
 from eerieview.cmor import to_cmor_names
 from eerieview.constants import CMOR2C3SATLAS
@@ -17,6 +18,7 @@ from eerieview.logger import get_logger
 from eerieview.metadata import fix_attributes
 from eerieview.product_computation import get_time_series
 
+load_dotenv()
 # Initialize logger for the module.
 logger = get_logger(__name__)
 
@@ -148,11 +150,15 @@ def main():
     obsdir = Path(os.environ["OBSDIR"])
     # Define the output directory for processed time series.
     output_dir = Path(os.environ["PRODUCTSDIR"], "time_series")
-    region_set = "IPCC"  # Define the default region set for spatial aggregation.
+    region_set = [
+        "IPCC",
+        "EDDY",
+    ]  # Define the default region set for spatial aggregation.
 
     # Define reference periods for different datasets.
-    reference_period_era5 = (1951, 1970)
-    reference_period_aviso = (1991, 2010)
+    reference_period_era5 = (1951, 1980)
+    reference_period_aviso = (1991, 2020)
+    reference_period_oras5 = (1958, 1980)
 
     # --- ERA5 Data Processing ---
     # List of variables to process for ERA5.
@@ -169,31 +175,46 @@ def main():
     ]
     # Process each variable using ERA5 data.
     for varname in variables_era5:
-        logger.info(f"Processing {varname} data from ERA5.")
-        get_obs_time_series(
-            varname,
-            obsdir,
-            output_dir,
-            "era5",  # Source is ERA5
-            region_set,
-            reference_period=reference_period_era5,
-            clobber=True,
-        )
+        for rs in region_set:
+            logger.info(f"Processing {varname} data from ERA5.")
+            get_obs_time_series(
+                varname,
+                obsdir,
+                output_dir,
+                "era5",  # Source is ERA5
+                rs,
+                reference_period=reference_period_era5,
+                clobber=True,
+            )
 
     # --- AVISO Data Processing ---
     # List of variables to process for AVISO.
     variables_aviso = ["zos", "eke"]
     # Process each variable using AVISO data.
     for varname in variables_aviso:
-        logger.info(f"Processing {varname} data from AVISO.")
+        for rs in region_set:
+            logger.info(f"Processing {varname} data from AVISO.")
+            get_obs_time_series(
+                varname,
+                obsdir,
+                output_dir,
+                "aviso",  # Source is AVISO
+                rs,
+                reference_period=reference_period_aviso,
+                clobber=False,
+            )
+
+    # --- ORAS5 Data Processing ---
+    for rs in region_set:
+        logger.info("Processing sos data from ORAS5.")
         get_obs_time_series(
-            varname,
+            "sos",
             obsdir,
             output_dir,
-            "aviso",  # Source is AVISO
-            region_set,
-            reference_period=reference_period_aviso,
-            clobber=False,  # Do not overwrite existing files for AVISO data.
+            "oras5",
+            rs,
+            reference_period=reference_period_oras5,
+            clobber=False,
         )
 
 

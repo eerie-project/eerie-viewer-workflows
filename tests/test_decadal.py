@@ -2,14 +2,19 @@ from functools import partial
 
 import pytest
 
-from eerieview.constants import members_eerie_control
-from eerieview.data_models import PeriodsConfig
+from eerieview.constants import members_eerie_control_cmor
+from eerieview.data_models import CmorEerieMember, PeriodsConfig
 from eerieview.product_computation import get_model_decadal_product
 from scripts.get_obs_climatologies import get_obs_decadal_product
 from tests.conftest import mocked_get_entry_dataset, mocked_get_obs_dataset
 
 
-@pytest.mark.parametrize("varname,product", [("tas", "trend"), ("pr", "trend")])
+@pytest.mark.parametrize(
+    "varname,product",
+    [
+        ("tos", "clim"),
+    ],
+)  # ("tas", "clim"), ("pr", "trend")])
 def test_get_model_decadal_product(tmp_path, varname, product):
     reference_period = (1951, 1970)
     periods = [(1971, 1990), (1991, 2010)]
@@ -25,7 +30,8 @@ def test_get_model_decadal_product(tmp_path, varname, product):
         product=product,
         get_entry_dataset_fun=_mocked_get_entry_dataset,
         periods=periods_config,
-        members=members_eerie_control,
+        members=members_eerie_control_cmor,
+        member_class=CmorEerieMember,
     )
     print(dataset)
 

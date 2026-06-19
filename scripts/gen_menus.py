@@ -9,8 +9,15 @@ def main():
     # The Real experiment layout is more complex (there are two kind of hist and controls)
     # https://eerie-project.eu/research/modelling/simulations-descriptions/
 
-    datasets = ["hist", "hist-amip", "control", "obs"]
-    members_coupled = ["ifs-fesom", "icon"]  # ifs-nemo + 3x HadGEM
+    datasets = ["future", "hist", "hist-amip", "control", "obs"]
+    members_coupled = [
+        "ifs-fesom",
+        "icon",
+        "ifs-nemo-er",
+        #        "hadgem3-mediumres",
+        "hadgem3-hires",
+        "hadgem3-lowres",
+    ]
     members_amip = [
         "ifs-amip-tco1279.hist",
         "ifs-amip-tco1279.hist-c-0-a-lr20",
