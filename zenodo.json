@@ -1,0 +1,31 @@
+{
+  "title": "EERIE Data Viewer Workflows",
+  "creators": [
+    {
+      "name": "García-Díez, Markel",
+      "affiliation": "Predictia Intelligent Data Solutions S.L."
+    },
+    {
+      "name": "Vallès‐Casanova, Ignasi",
+      "affiliation": "Predictia Intelligent Data Solutions S.L."
+    }
+  ],
+  "description": "Functions and workflows for preparing data for visualization for the EERIE project data viewer (https://dataviewer.eerie-project.eu/). The input data is read from the EERIE intake catalogues and, in the case of observations, from netCDF files.",
+  "license": "BSD-3-Clause",
+  "keywords": [
+    "EERIE",
+    "EERIE viewer",
+    "workflows"
+  ],
+  "related_identifiers": [
+    {
+      "relation": "isSupplementTo",
+      "identifier": "https://dataviewer.eerie-project.eu/"
+    }
+  ],
+  "grants": [
+    {
+      "id": "10.13039/501100000780::101081383"
+    }
+  ]
+}
